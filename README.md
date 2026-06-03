@@ -169,6 +169,36 @@ Use the KDE autostart option in the installer (or set it manually) to reapply yo
 
 
 
+## Graphical Interface (vrgb-gui)
+
+A PyQt6 desktop frontend is included. It is a thin GUI over the CLI: it imports
+`vrgb` as a module and drives the keyboard in-process, so the HID protocol and
+config logic are shared with the command line — no duplicated device code.
+
+**Features**
+
+- HS color wheel + value slider, hex entry, and preset swatches
+- Live preview while you drag (throttled), persisted on release
+- Brightness slider (0–100%) and a power on/off toggle
+- Firmware/autonomous mode toggle
+- OEM rainbow toggle (auto-disabled on device mappings that do not support it)
+- Profile manager (save / load / delete)
+- System-tray applet: quick on/off, brightness, and profile loading; closing the
+  window hides it to the tray
+- Falls back to a Polkit (`pkexec`) password prompt if the `vrgb` group is not yet
+  active in your session (i.e. before the first logout/login after install)
+
+**Install (after `./install.sh`)**
+
+    chmod +x install-gui.sh
+    ./install-gui.sh
+
+Requires `PyQt6` (`sudo dnf install python3-pyqt6` on Fedora). Launch it from your
+application menu (search "VRGB") or run `vrgb-gui`. Start the tray on login with
+the installer's autostart option, or run `vrgb-gui --tray`.
+
+
+
 ## Command List
 
 Show Current Status
@@ -297,9 +327,10 @@ Removes:
 ## Future Development
 
 - expanded ASUS hardware compatibility
-- simple GUI frontend
-- color picker / brightness control
-- profile management
+- ~~simple GUI frontend~~ — added (`vrgb-gui`, PyQt6)
+- ~~color picker / brightness control~~ — added
+- ~~profile management~~ — added (CLI + GUI)
+- packaged distribution (RPM / Flatpak)
 
 With future updates in mind, this project will aim to continue to be as efficient and lightweight as possible.
 

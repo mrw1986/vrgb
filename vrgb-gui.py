@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""
+VRGB GUI — a PyQt6 frontend for the `vrgb` CLI (ASUS Vivobook ITE5570 RGB keyboards).
+
+Design:
+  * The GUI imports the installed `vrgb` script as a module (importlib) and calls its
+    functions in-process for low-latency control of the keyboard. This reuses the exact
+    HID protocol, report-id mapping and config logic from the CLI — no duplication.
+  * All device I/O happens on a dedicated worker thread so the UI never blocks.
+  * If opening the hidraw device raises PermissionError (e.g. the user is in the `vrgb`
+    group but has not logged out/in yet, so the group is not active in this session),
+    persisting actions fall back to `pkexec vrgb ...`, which prompts for a password via
+    Polkit and runs as root. Live "preview" drags are best-effort and silently skipped
+    in that case (to avoid password spam) until the group is active.
+
+State (color / brightness / profiles / autonomous) lives in ~/.config/vrgb/config.json,
+read through the imported module's load_config().
+"""
+
+import sys
+import io
+import os
+import math
+import queue
+import subprocess
+import contextlib
+import importlib.util
+import importlib.machinery
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject, QSize, QPointF
+from PyQt6.QtGui import (
+    QColor,
+    QConicalGradient,
+    QRadialGradient,
+    QPainter,
+    QPen,
+    QBrush,
+    QIcon,
+    QPixmap,
+    QAction,
+    QGuiApplication,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QMainWindow,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QSlider,
+    QPushButton,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QCheckBox,
+    QGroupBox,
+    QInputDialog,
+    QMessageBox,
+    QSystemTrayIcon,
+    QMenu,
+    QSizePolicy,
+    QFrame,
+)
+
+
+# ----------------------------------------------------------------------------
+# Locate + import the vrgb core script as a module
+# ----------------------------------------------------------------------------
+
+def _core_candidates():
+    here = Path(__file__).resolve().parent
+    return [
+        Path("/usr/local/bin/vrgb"),   # installed CLI (preferred; also used for pkexec)
+        here / "vrgb.py",              # running from the repo checkout
+    ]
+
+
+def load_core():
+    for path in _core_candidates():
+        if path.exists():
+            loader = importlib.machinery.SourceFileLoader("vrgb_core", str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)   # main() is guarded by __name__ == "__main__"
+            return mod, path
+    raise FileNotFoundError(
+        "Could not find the vrgb core script. Install it (./install.sh) or run the GUI "
+        "from the repository checkout next to vrgb.py."
+    )
+
+
+# Prefer the installed root-owned binary for pkexec; fall back to whatever we imported.
+def pkexec_target(core_path):
+    installed = Path("/usr/local/bin/vrgb")
+    return str(installed if installed.exists() else core_path)
+
+
+# ----------------------------------------------------------------------------
+# Worker thread: serializes all device I/O off the UI thread
+# ----------------------------------------------------------------------------
+
+class DeviceWorker(QThread):
+    # op name, ok, human message
+    op_done = pyqtSignal(str, bool, str)
+    # devinfo dict or None, error message
+    device_status = pyqtSignal(object, str)
+    # fresh config dict after a state-changing op
+    config_updated = pyqtSignal(dict)
+
+    def __init__(self, mod, core_path, parent=None):
+        super().__init__(parent)
+        self.mod = mod
+        self.pkexec_bin = pkexec_target(core_path)
+        self.q: "queue.Queue" = queue.Queue()
+        self._devinfo = None
+        self._running = True
+
+    # -- public API (called from the UI thread) --
+    def submit(self, op, *args):
+        self.q.put((op, args))
+
+    def stop(self):
+        self._running = False
+        self.q.put(("quit", ()))
+
+    # -- internals (run on the worker thread) --
+    def run(self):
+        while self._running:
+            try:
+                op, args = self.q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if op == "quit":
+                break
+            # Coalesce a backlog of preview color/brightness ops to the newest.
+            op, args = self._coalesce(op, args)
+            try:
+                self._dispatch(op, args)
+            except Exception as exc:  # never let the worker die
+                self.op_done.emit(op, False, f"{type(exc).__name__}: {exc}")
+
+    def _coalesce(self, op, args):
+        # If newer same-kind preview ops are queued, skip ahead to the last one.
+        if op in ("color", "brightness"):
+            try:
+                while True:
+                    nxt_op, nxt_args = self.q.get_nowait()
+                    if nxt_op == op and not (nxt_args and nxt_args[-1]):  # persist == False
+                        op, args = nxt_op, nxt_args
+                    else:
+                        # put it back at the front by handling after; simplest: requeue
+                        self.q.put((nxt_op, nxt_args))
+                        break
+            except queue.Empty:
+                pass
+        return op, args
+
+    def _ensure_device(self):
+        if self._devinfo is not None:
+            return self._devinfo
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
+                self._devinfo = self.mod.find_device()
+            self.device_status.emit(self._devinfo, "")
+        except SystemExit:
+            msg = buf.getvalue().strip() or "VRGB keyboard not found"
+            self.device_status.emit(None, msg)
+            raise
+        return self._devinfo
+
+    def _cfg(self):
+        return self.mod.load_config()
+
+    def _emit_cfg(self, cfg):
+        self.config_updated.emit(dict(cfg))
+
+    def _run_cli(self, cli_args):
+        """Privileged fallback via pkexec (Polkit GUI password prompt)."""
+        res = subprocess.run(
+            ["pkexec", self.pkexec_bin, *cli_args],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "pkexec failed").strip()
+            raise RuntimeError(err)
+
+    def _dispatch(self, op, args):
+        mod = self.mod
+
+        if op == "detect":
+            try:
+                self._ensure_device()
+            except SystemExit:
+                pass
+            return
+
+        if op == "color":
+            hexcol, percent, persist = args
+            try:
+                dev = self._ensure_device()
+            except SystemExit:
+                return
+            try:
+                if persist:
+                    cfg = self._cfg()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        mod.cmd_set(cfg, dev, hexcol, str(percent))
+                    self._emit_cfg(cfg)
+                    self.op_done.emit("color", True, f"Set #{hexcol} @ {percent}%")
+                else:
+                    r, g, b = mod.hex_to_rgb(hexcol)
+                    intensity = mod.percent_to_intensity(percent)
+                    mod.set_firmware_mode(dev, False)
+                    mod.set_color(dev, r, g, b, intensity)
+            except PermissionError:
+                if persist:
+                    self._run_cli(["set", hexcol, str(percent)])
+                    self._emit_cfg(self._cfg())
+                    self.op_done.emit("color", True, f"Set #{hexcol} @ {percent}% (pkexec)")
+                # preview: silently skip when not permitted
+            return
+
+        if op == "brightness":
+            percent, persist = args
+            try:
+                dev = self._ensure_device()
+            except SystemExit:
+                return
+            try:
+                if persist:
+                    cfg = self._cfg()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        mod.cmd_brightness(cfg, dev, str(percent))
+                    self._emit_cfg(cfg)
+                    self.op_done.emit("brightness", True, f"Brightness {percent}%")
+                else:
+                    cfg = self._cfg()
+                    r, g, b = mod.hex_to_rgb(cfg["color"])
+                    intensity = mod.percent_to_intensity(percent)
+                    mod.set_firmware_mode(dev, False)
+                    mod.set_color(dev, r, g, b, intensity)
+            except PermissionError:
+                if persist:
+                    self._run_cli(["brightness", str(percent)])
+                    self._emit_cfg(self._cfg())
+                    self.op_done.emit("brightness", True, f"Brightness {percent}% (pkexec)")
+            return
+
+        if op == "power":
+            (on,) = args
+            try:
+                dev = self._ensure_device()
+            except SystemExit:
+                return
+            cfg = self._cfg()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if on:
+                        mod.cmd_restore(cfg, dev)
+                    else:
+                        mod.cmd_off(cfg, dev)
+                self._emit_cfg(cfg)
+                self.op_done.emit("power", True, "On" if on else "Off")
+            except PermissionError:
+                self._run_cli(["restore" if on else "off"])
+                self._emit_cfg(self._cfg())
+                self.op_done.emit("power", True, ("On" if on else "Off") + " (pkexec)")
+            return
+
+        if op == "auto":
+            (on,) = args
+            try:
+                dev = self._ensure_device()
+            except SystemExit:
+                return
+            cfg = self._cfg()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.cmd_auto(cfg, dev, "on" if on else "off")
+                self._emit_cfg(cfg)
+                self.op_done.emit("auto", True, "Firmware mode " + ("on" if on else "off"))
+            except PermissionError:
+                self._run_cli(["auto", "on" if on else "off"])
+                self._emit_cfg(self._cfg())
+                self.op_done.emit("auto", True, "Firmware mode " + ("on" if on else "off") + " (pkexec)")
+            return
+
+        if op == "rainbow":
+            (on,) = args
+            try:
+                dev = self._ensure_device()
+            except SystemExit:
+                return
+            cfg = self._cfg()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.cmd_rainbow(cfg, dev, "on" if on else "off")
+                self._emit_cfg(cfg)
+                self.op_done.emit("rainbow", True, "Rainbow " + ("on" if on else "off"))
+            except PermissionError:
+                # rainbow needs root for the ASUS WMI debugfs regardless of the vrgb group
+                self._run_cli(["rainbow", "on" if on else "off"])
+                self._emit_cfg(self._cfg())
+                self.op_done.emit("rainbow", True, "Rainbow " + ("on" if on else "off") + " (pkexec)")
+            except SystemExit:
+                self.op_done.emit("rainbow", False, "OEM rainbow not supported on this device")
+            return
+
+        if op == "profile_save":
+            (name,) = args
+            cfg = self._cfg()
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.cmd_profile_save(cfg, name)
+            self._emit_cfg(cfg)
+            self.op_done.emit("profile_save", True, f"Saved profile '{name}'")
+            return
+
+        if op == "profile_delete":
+            (name,) = args
+            cfg = self._cfg()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.cmd_profile_delete(cfg, name)
+                self._emit_cfg(cfg)
+                self.op_done.emit("profile_delete", True, f"Deleted profile '{name}'")
+            except SystemExit:
+                self.op_done.emit("profile_delete", False, f"Profile '{name}' not found")
+            return
+
+        if op == "profile_load":
+            (name,) = args
+            try:
+                dev = self._ensure_device()
+            except SystemExit:
+                return
+            cfg = self._cfg()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mod.cmd_profile_load(cfg, dev, name)
+                self._emit_cfg(cfg)
+                self.op_done.emit("profile_load", True, f"Loaded profile '{name}'")
+            except PermissionError:
+                self._run_cli(["profile", "load", name])
+                self._emit_cfg(self._cfg())
+                self.op_done.emit("profile_load", True, f"Loaded profile '{name}' (pkexec)")
+            except SystemExit:
+                self.op_done.emit("profile_load", False, f"Profile '{name}' not found")
+            return
+
+
+# ----------------------------------------------------------------------------
+# HS color wheel widget
+# ----------------------------------------------------------------------------
+
+class ColorWheel(QWidget):
+    """Hue/Saturation wheel. Value (lightness) is supplied externally."""
+
+    hs_changed = pyqtSignal(float, float)   # hue 0..1, saturation 0..1
+    released = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._h = 0.0
+        self._s = 0.0
+        self._value = 1.0
+        self.setMinimumSize(220, 220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_hsv(self, h, s, v):
+        self._h, self._s, self._value = h, s, v
+        self.update()
+
+    def set_value(self, v):
+        self._value = v
+        self.update()
+
+    def _geom(self):
+        side = min(self.width(), self.height()) - 8
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        return cx, cy, side / 2.0
+
+    def paintEvent(self, _evt):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy, r = self._geom()
+        rect_center = QPointF(cx, cy)
+
+        # Hue ring via conical gradient
+        hue_grad = QConicalGradient(rect_center, 0.0)
+        for i in range(0, 361, 30):
+            hue_grad.setColorAt(i / 360.0, QColor.fromHsvF((i % 360) / 360.0, 1.0, 1.0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(hue_grad))
+        p.drawEllipse(rect_center, r, r)
+
+        # Saturation: white center fading out
+        sat_grad = QRadialGradient(rect_center, r)
+        sat_grad.setColorAt(0.0, QColor(255, 255, 255, 255))
+        sat_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setBrush(QBrush(sat_grad))
+        p.drawEllipse(rect_center, r, r)
+
+        # Darken the whole wheel to reflect current Value
+        if self._value < 1.0:
+            shade = int((1.0 - self._value) * 255)
+            p.setBrush(QColor(0, 0, 0, shade))
+            p.drawEllipse(rect_center, r, r)
+
+        # Selector marker
+        angle = self._h * 2.0 * math.pi
+        dist = self._s * r
+        mx = cx + dist * math.cos(angle)
+        my = cy - dist * math.sin(angle)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 200), 3))
+        p.drawEllipse(QPointF(mx, my), 8, 8)
+        p.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        p.drawEllipse(QPointF(mx, my), 8, 8)
+
+    def _pick(self, pos):
+        cx, cy, r = self._geom()
+        dx = pos.x() - cx
+        dy = cy - pos.y()
+        dist = math.hypot(dx, dy)
+        self._s = min(1.0, dist / r) if r > 0 else 0.0
+        ang = math.atan2(dy, dx)
+        if ang < 0:
+            ang += 2.0 * math.pi
+        self._h = ang / (2.0 * math.pi)
+        self.update()
+        self.hs_changed.emit(self._h, self._s)
+
+    def mousePressEvent(self, e):
+        self._pick(e.position())
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.MouseButton.LeftButton:
+            self._pick(e.position())
+
+    def mouseReleaseEvent(self, _e):
+        self.released.emit()
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+PRESETS = [
+    ("Red", "ff0000"), ("Orange", "ff6a00"), ("Yellow", "ffd400"),
+    ("Green", "00ff44"), ("Cyan", "00e5ff"), ("Blue", "0066ff"),
+    ("Purple", "aa00ff"), ("Magenta", "ff00aa"), ("White", "ffffff"),
+]
+
+
+def make_logo_icon():
+    for cand in ("/usr/share/pixmaps/vrgb.png",
+                 str(Path(__file__).resolve().parent / "assets" / "vrgblogodark.png")):
+        if os.path.exists(cand):
+            ic = QIcon(cand)
+            if not ic.isNull():
+                return ic
+    # Fallback: a small rainbow ring pixmap
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    grad = QConicalGradient(32, 32, 0)
+    for i in range(0, 361, 30):
+        grad.setColorAt(i / 360.0, QColor.fromHsvF((i % 360) / 360.0, 1.0, 1.0))
+    p.setPen(QPen(QBrush(grad), 10))
+    p.drawEllipse(10, 10, 44, 44)
+    p.end()
+    return QIcon(pm)
+
+
+# ----------------------------------------------------------------------------
+# Main window
+# ----------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self, worker: DeviceWorker, mod):
+        super().__init__()
+        self.worker = worker
+        self.mod = mod
+        self._suppress = False           # block feedback loops while we set widgets
+        self._interacting = False        # user dragging color
+        self._devinfo = None
+
+        self.setWindowTitle("VRGB — Keyboard RGB")
+        self.setWindowIcon(make_logo_icon())
+
+        cfg = mod.load_config()
+        self._color = QColor("#" + cfg.get("color", "aa00ff"))
+        self._percent = int(cfg.get("percent", 100))
+
+        self._build_ui()
+        self._wire_worker()
+
+        # Throttle timer for live preview during drags
+        self._preview = QTimer(self)
+        self._preview.setSingleShot(True)
+        self._preview.setInterval(45)
+        self._preview.timeout.connect(self._emit_preview)
+        self._pending = None  # ("color"/"brightness", ...)
+
+        self._load_from_cfg(cfg)
+        self.worker.submit("detect")
+
+    # -- UI construction --
+    def _build_ui(self):
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(10)
+
+        # Status line
+        self.status_lbl = QLabel("Detecting keyboard…")
+        self.status_lbl.setStyleSheet("color:#999;")
+        root.addWidget(self.status_lbl)
+
+        # --- Color row: wheel + value slider + swatch/hex ---
+        color_box = QGroupBox("Color")
+        cgrid = QGridLayout(color_box)
+
+        self.wheel = ColorWheel()
+        cgrid.addWidget(self.wheel, 0, 0, 4, 1)
+
+        self.value_slider = QSlider(Qt.Orientation.Vertical)
+        self.value_slider.setRange(0, 100)
+        self.value_slider.setValue(100)
+        self.value_slider.setToolTip("Value (color lightness)")
+        cgrid.addWidget(self.value_slider, 0, 1, 4, 1)
+
+        self.swatch = QFrame()
+        self.swatch.setMinimumSize(64, 64)
+        self.swatch.setFrameShape(QFrame.Shape.StyledPanel)
+        cgrid.addWidget(self.swatch, 0, 2)
+
+        cgrid.addWidget(QLabel("Hex"), 1, 2)
+        self.hex_edit = QLineEdit()
+        self.hex_edit.setMaxLength(7)
+        self.hex_edit.setPlaceholderText("#rrggbb")
+        cgrid.addWidget(self.hex_edit, 2, 2)
+
+        # preset swatches
+        preset_row = QHBoxLayout()
+        for name, hexc in PRESETS:
+            b = QPushButton()
+            b.setFixedSize(24, 24)
+            b.setToolTip(name)
+            b.setStyleSheet(f"background:#{hexc}; border:1px solid #444; border-radius:4px;")
+            b.clicked.connect(lambda _=False, h=hexc: self._apply_hex("#" + h, commit=True))
+            preset_row.addWidget(b)
+        preset_row.addStretch(1)
+        cgrid.addLayout(preset_row, 4, 0, 1, 3)
+
+        root.addWidget(color_box)
+
+        # --- Brightness + power ---
+        bbox = QGroupBox("Brightness & power")
+        bl = QGridLayout(bbox)
+        self.power_btn = QPushButton("Power")
+        self.power_btn.setCheckable(True)
+        self.power_btn.setMinimumWidth(90)
+        bl.addWidget(self.power_btn, 0, 0, 2, 1)
+
+        bl.addWidget(QLabel("Brightness"), 0, 1)
+        self.bright_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bright_slider.setRange(0, 100)
+        self.bright_slider.setValue(self._percent)
+        bl.addWidget(self.bright_slider, 0, 2)
+        self.bright_lbl = QLabel(f"{self._percent}%")
+        self.bright_lbl.setMinimumWidth(40)
+        bl.addWidget(self.bright_lbl, 0, 3)
+
+        self.auto_chk = QCheckBox("Firmware / autonomous mode")
+        self.auto_chk.setToolTip("Hand control back to the keyboard firmware")
+        bl.addWidget(self.auto_chk, 1, 1, 1, 2)
+
+        self.rainbow_chk = QCheckBox("OEM rainbow")
+        bl.addWidget(self.rainbow_chk, 1, 3)
+
+        root.addWidget(bbox)
+
+        # --- Profiles ---
+        pbox = QGroupBox("Profiles")
+        pl = QGridLayout(pbox)
+        self.profile_list = QListWidget()
+        self.profile_list.setMaximumHeight(110)
+        pl.addWidget(self.profile_list, 0, 0, 4, 1)
+        self.btn_load = QPushButton("Load")
+        self.btn_save = QPushButton("Save current…")
+        self.btn_delete = QPushButton("Delete")
+        pl.addWidget(self.btn_save, 0, 1)
+        pl.addWidget(self.btn_load, 1, 1)
+        pl.addWidget(self.btn_delete, 2, 1)
+        root.addWidget(pbox)
+
+        self.setCentralWidget(central)
+
+        # Signal wiring
+        self.wheel.hs_changed.connect(self._on_wheel)
+        self.wheel.released.connect(self._commit_color)
+        self.value_slider.valueChanged.connect(self._on_value)
+        self.value_slider.sliderReleased.connect(self._commit_color)
+        self.hex_edit.editingFinished.connect(lambda: self._apply_hex(self.hex_edit.text(), commit=True))
+        self.bright_slider.valueChanged.connect(self._on_brightness)
+        self.bright_slider.sliderReleased.connect(self._commit_brightness)
+        self.power_btn.clicked.connect(self._on_power)
+        self.auto_chk.toggled.connect(self._on_auto)
+        self.rainbow_chk.toggled.connect(self._on_rainbow)
+        self.btn_save.clicked.connect(self._profile_save)
+        self.btn_load.clicked.connect(self._profile_load)
+        self.btn_delete.clicked.connect(self._profile_delete)
+        self.profile_list.itemDoubleClicked.connect(lambda _i: self._profile_load())
+
+    def _wire_worker(self):
+        self.worker.op_done.connect(self._on_op_done)
+        self.worker.device_status.connect(self._on_device_status)
+        self.worker.config_updated.connect(self._on_config_updated)
+
+    # -- config <-> widgets --
+    def _load_from_cfg(self, cfg):
+        self._suppress = True
+        self._color = QColor("#" + cfg.get("color", "aa00ff"))
+        self._percent = int(cfg.get("percent", 100))
+        h, s, v, _ = self._color.getHsvF()
+        h = max(h, 0.0)
+        self.wheel.set_hsv(h, s, v)
+        self.value_slider.setValue(int(v * 100))
+        self.hex_edit.setText(self._color.name())
+        self._update_swatch()
+        self.bright_slider.setValue(self._percent)
+        self.bright_lbl.setText(f"{self._percent}%")
+        self.power_btn.setChecked(self._percent > 0)
+        self.power_btn.setText("On" if self._percent > 0 else "Off")
+        self.auto_chk.setChecked(bool(cfg.get("autonomous", False)))
+        self._reload_profiles(cfg)
+        self._suppress = False
+
+    def _reload_profiles(self, cfg):
+        self.profile_list.clear()
+        for name in sorted(cfg.get("profiles", {})):
+            self.profile_list.addItem(QListWidgetItem(name))
+
+    def _update_swatch(self):
+        self.swatch.setStyleSheet(
+            f"background:{self._color.name()}; border:1px solid #333; border-radius:6px;"
+        )
+
+    def _current_hex(self):
+        return self._color.name().lstrip("#")
+
+    # -- interaction handlers --
+    def _on_wheel(self, h, s):
+        if self._suppress:
+            return
+        v = self.value_slider.value() / 100.0
+        self._color = QColor.fromHsvF(h, s, v)
+        self._sync_color_widgets(update_wheel=False)
+        self._queue_preview("color")
+
+    def _on_value(self, val):
+        if self._suppress:
+            return
+        h, s, _v, _a = self._color.getHsvF()
+        self._color = QColor.fromHsvF(max(h, 0.0), s, val / 100.0)
+        self.wheel.set_value(val / 100.0)
+        self._sync_color_widgets(update_wheel=False)
+        self._queue_preview("color")
+
+    def _apply_hex(self, text, commit=False):
+        text = text.strip()
+        if not text.startswith("#"):
+            text = "#" + text
+        col = QColor(text)
+        if not col.isValid():
+            return
+        self._color = col
+        self._sync_color_widgets(update_wheel=True)
+        if commit:
+            self._commit_color()
+
+    def _sync_color_widgets(self, update_wheel):
+        self._suppress = True
+        if update_wheel:
+            h, s, v, _ = self._color.getHsvF()
+            self.wheel.set_hsv(max(h, 0.0), s, v)
+            self.value_slider.setValue(int(v * 100))
+        self.hex_edit.setText(self._color.name())
+        self._update_swatch()
+        self._suppress = False
+
+    def _queue_preview(self, kind):
+        self._interacting = True
+        if kind == "color":
+            self._pending = ("color", self._current_hex(), self._percent)
+        else:
+            self._pending = ("brightness", self.bright_slider.value())
+        if not self._preview.isActive():
+            self._preview.start()
+
+    def _emit_preview(self):
+        if not self._pending:
+            return
+        kind = self._pending[0]
+        if kind == "color":
+            _, hexc, pct = self._pending
+            self.worker.submit("color", hexc, pct, False)
+        else:
+            _, pct = self._pending
+            self.worker.submit("brightness", pct, False)
+        self._pending = None
+
+    def _commit_color(self):
+        self._preview.stop()
+        self._pending = None
+        self._interacting = False
+        self.worker.submit("color", self._current_hex(), self._percent, True)
+
+    def _on_brightness(self, val):
+        if self._suppress:
+            return
+        self.bright_lbl.setText(f"{val}%")
+        self._percent = val
+        self.power_btn.setChecked(val > 0)
+        self.power_btn.setText("On" if val > 0 else "Off")
+        self._queue_preview("brightness")
+
+    def _commit_brightness(self):
+        self._preview.stop()
+        self._pending = None
+        self.worker.submit("brightness", self.bright_slider.value(), True)
+
+    def _on_power(self, checked):
+        if self._suppress:
+            return
+        self.power_btn.setText("On" if checked else "Off")
+        self.worker.submit("power", bool(checked))
+
+    def _on_auto(self, checked):
+        if self._suppress:
+            return
+        self.worker.submit("auto", bool(checked))
+
+    def _on_rainbow(self, checked):
+        if self._suppress:
+            return
+        self.worker.submit("rainbow", bool(checked))
+
+    # -- profiles --
+    def _profile_save(self):
+        name, ok = QInputDialog.getText(self, "Save profile", "Profile name:")
+        if ok and name.strip():
+            self.worker.submit("profile_save", name.strip())
+
+    def _profile_load(self):
+        item = self.profile_list.currentItem()
+        if item:
+            self.worker.submit("profile_load", item.text())
+
+    def _profile_delete(self):
+        item = self.profile_list.currentItem()
+        if not item:
+            return
+        if QMessageBox.question(self, "Delete profile", f"Delete '{item.text()}'?") \
+                == QMessageBox.StandardButton.Yes:
+            self.worker.submit("profile_delete", item.text())
+
+    # -- worker callbacks --
+    def _on_op_done(self, op, ok, msg):
+        self.status_lbl.setStyleSheet("color:#5c5;" if ok else "color:#d55;")
+        self.status_lbl.setText(("✓ " if ok else "✗ ") + msg)
+
+    def _on_device_status(self, devinfo, err):
+        self._devinfo = devinfo
+        if devinfo:
+            rainbow_ok = bool(devinfo.get("rainbow_supported", False))
+            self.rainbow_chk.setEnabled(rainbow_ok)
+            if not rainbow_ok:
+                self.rainbow_chk.setToolTip(
+                    "OEM rainbow is not supported on this device mapping "
+                    f"({devinfo.get('hid_id', '')})"
+                )
+            self.status_lbl.setStyleSheet("color:#5c5;")
+            self.status_lbl.setText(f"● {devinfo.get('model', 'keyboard')}  ·  {devinfo.get('path','')}")
+        else:
+            self.rainbow_chk.setEnabled(False)
+            self.status_lbl.setStyleSheet("color:#d55;")
+            self.status_lbl.setText("✗ " + (err or "Keyboard not found"))
+
+    def _on_config_updated(self, cfg):
+        # Refresh non-interactive widgets; never yank the wheel mid-drag.
+        if self._interacting:
+            self._reload_profiles(cfg)
+            return
+        self._load_from_cfg(cfg)
+
+
+# ----------------------------------------------------------------------------
+# Tray
+# ----------------------------------------------------------------------------
+
+class Tray(QSystemTrayIcon):
+    def __init__(self, window: MainWindow, worker: DeviceWorker, app: QApplication):
+        super().__init__(make_logo_icon())
+        self.window = window
+        self.worker = worker
+        self.app = app
+        self.setToolTip("VRGB — keyboard RGB")
+
+        menu = QMenu()
+        self.act_show = QAction("Show / hide window")
+        self.act_show.triggered.connect(self._toggle_window)
+        menu.addAction(self.act_show)
+        menu.addSeparator()
+
+        self.act_on = QAction("Turn on")
+        self.act_on.triggered.connect(lambda: self.worker.submit("power", True))
+        self.act_off = QAction("Turn off")
+        self.act_off.triggered.connect(lambda: self.worker.submit("power", False))
+        menu.addAction(self.act_on)
+        menu.addAction(self.act_off)
+
+        bmenu = menu.addMenu("Brightness")
+        for pct in (25, 50, 75, 100):
+            a = QAction(f"{pct}%", self)
+            a.triggered.connect(lambda _=False, p=pct: self.worker.submit("brightness", p, True))
+            bmenu.addAction(a)
+
+        self.profiles_menu = menu.addMenu("Profiles")
+        self._rebuild_profiles(window.mod.load_config())
+        worker.config_updated.connect(self._rebuild_profiles)
+
+        menu.addSeparator()
+        act_quit = QAction("Quit")
+        act_quit.triggered.connect(self._quit)
+        menu.addAction(act_quit)
+
+        self.setContextMenu(menu)
+        self.activated.connect(self._on_activated)
+
+    def _rebuild_profiles(self, cfg):
+        self.profiles_menu.clear()
+        names = sorted(cfg.get("profiles", {}))
+        if not names:
+            a = QAction("(none saved)", self)
+            a.setEnabled(False)
+            self.profiles_menu.addAction(a)
+            return
+        for name in names:
+            a = QAction(name, self)
+            a.triggered.connect(lambda _=False, n=name: self.worker.submit("profile_load", n))
+            self.profiles_menu.addAction(a)
+
+    def _on_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._toggle_window()
+
+    def _toggle_window(self):
+        if self.window.isVisible() and not self.window.isMinimized():
+            self.window.hide()
+        else:
+            self.window.showNormal()
+            self.window.raise_()
+            self.window.activateWindow()
+
+    def _quit(self):
+        self.worker.stop()
+        self.worker.wait(2000)
+        self.app.quit()
+
+
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+
+def main():
+    try:
+        mod, core_path = load_core()
+    except FileNotFoundError as exc:
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "VRGB GUI", str(exc))
+        return 1
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("VRGB GUI")
+    app.setWindowIcon(make_logo_icon())
+    app.setQuitOnLastWindowClosed(False)   # live in the tray
+
+    worker = DeviceWorker(mod, core_path)
+    worker.start()
+
+    window = MainWindow(worker, mod)
+
+    tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
+    tray = Tray(window, worker, app) if tray_ok else None
+    if tray:
+        tray.show()
+
+    # Hide-to-tray on window close (if a tray exists); otherwise closing quits.
+    if tray:
+        def close_event(e):
+            e.ignore()
+            window.hide()
+            tray.showMessage("VRGB", "Still running in the tray.",
+                             QSystemTrayIcon.MessageIcon.Information, 2000)
+        window.closeEvent = close_event
+
+    # Start with the window shown unless launched with --tray
+    if "--tray" not in sys.argv:
+        window.show()
+    elif not tray:
+        window.show()
+
+    rc = app.exec()
+    worker.stop()
+    worker.wait(2000)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
