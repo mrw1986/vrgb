@@ -188,8 +188,10 @@ config logic are shared with the command line — no duplicated device code.
 - Firmware/autonomous mode toggle
 - OEM rainbow toggle (auto-disabled on device mappings that do not support it)
 - Profile manager (save / load / delete)
-- System-tray applet: quick on/off, brightness, and profile loading; closing the
-  window hides it to the tray
+- "Start at login" toggles (restore lighting / start tray) managed from inside the app
+- System-tray applet with an embedded brightness slider, a color-swatch row, a
+  "More colors…" dialog, on/off, and profile loading; closing the window hides it
+  to the tray
 - Falls back to a Polkit (`pkexec`) password prompt if the `vrgb` group is not yet
   active in your session (i.e. before the first logout/login after install)
 
