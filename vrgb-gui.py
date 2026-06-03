@@ -17,7 +17,18 @@ Design:
     never runs a user-writable script as root. The CLI honours PKEXEC_UID so the
     elevated run reads/writes the invoking user's ~/.config/vrgb, not /root's.
 
-State (color / brightness / profiles / autonomous) lives in ~/.config/vrgb/config.json,
+Unified brightness:
+  The ASUS keyboard has TWO brightness layers that multiply:
+    * the firmware backlight (FN+F4 / FN+F3) -> /sys/class/leds/asus::kbd_backlight,
+      a coarse 0..max (max=3) level set via logind (passwordless for the active session);
+    * vrgb's HID "intensity" byte (0..255), the fine per-color scaling.
+  The slider exposes a single unified brightness B (0..100%). It is decomposed into a
+  firmware step F and an HID intensity I such that (F/max) * (I/255) == B, so the two
+  layers never double-dim. The firmware level is polled, so FN+F4/F3 move the slider
+  (and the HID intensity) too. If the LED node or logind is unavailable the GUI falls
+  back to pure-HID brightness (B == I).
+
+State (color / intensity / profiles / autonomous) lives in ~/.config/vrgb/config.json,
 read through the imported module's load_config().
 """
 
@@ -25,6 +36,7 @@ import sys
 import os
 import math
 import copy
+import time
 import queue
 import subprocess
 import importlib.util
@@ -113,6 +125,51 @@ def pkexec_target():
 
 
 # ----------------------------------------------------------------------------
+# Firmware keyboard backlight (FN+F4 / FN+F3) via logind
+# ----------------------------------------------------------------------------
+
+class KbdBacklight:
+    """Reads/writes /sys/class/leds/asus::kbd_backlight.
+
+    Reads come straight from sysfs (world-readable). Writes go through logind's
+    SetBrightness, which Polkit allows for the active local session without a
+    password. Returns gracefully degraded values when the node is absent.
+    """
+
+    PATH = Path("/sys/class/leds/asus::kbd_backlight")
+    LED_NAME = "asus::kbd_backlight"
+
+    def __init__(self):
+        self.available = self.PATH.exists()
+        self.max = (self._read_int("max_brightness") or 0) if self.available else 0
+        if self.max <= 0:
+            self.available = False
+
+    def _read_int(self, name):
+        try:
+            return int((self.PATH / name).read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def level(self):
+        return self._read_int("brightness")
+
+    @staticmethod
+    def set_level(level):
+        try:
+            subprocess.run(
+                ["busctl", "call", "org.freedesktop.login1",
+                 "/org/freedesktop/login1/session/auto",
+                 "org.freedesktop.login1.Session", "SetBrightness", "ssu",
+                 "leds", KbdBacklight.LED_NAME, str(int(level))],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            return True
+        except Exception:
+            return False
+
+
+# ----------------------------------------------------------------------------
 # Worker thread: serializes all device I/O off the UI thread
 # ----------------------------------------------------------------------------
 
@@ -173,8 +230,6 @@ class DeviceWorker(QThread):
         return self.mod.load_config()
 
     def _emit_cfg(self, cfg):
-        # Emit an owned snapshot (own the nested profiles dict too) so the GUI
-        # thread never iterates a dict the worker might later mutate.
         snap = dict(cfg)
         snap["profiles"] = copy.deepcopy(cfg.get("profiles", {}))
         self.config_updated.emit(snap)
@@ -204,18 +259,21 @@ class DeviceWorker(QThread):
 
     # -- per-op handlers --
     def _dispatch(self, op, args):
-        mod = self.mod
         handler = getattr(self, f"_op_{op}", None)
         if handler is None:
             self.op_done.emit(op, False, f"unknown op '{op}'")
             return
-        handler(mod, *args)
+        handler(self.mod, *args)
 
     def _op_detect(self, mod):
         try:
             self._ensure_device()
         except SystemExit:
             pass
+
+    def _op_fwlevel(self, mod, level):
+        if not KbdBacklight.set_level(level):
+            self.op_done.emit("fwlevel", False, "Could not set keyboard backlight level")
 
     def _op_color(self, mod, hexcol, percent, persist):
         try:
@@ -227,7 +285,7 @@ class DeviceWorker(QThread):
                 cfg = self._cfg()
                 mod.cmd_set(cfg, dev, hexcol, str(percent))
                 self._emit_cfg(cfg)
-                self.op_done.emit("color", True, f"Set #{hexcol} @ {percent}%")
+                self.op_done.emit("color", True, f"Set #{hexcol}")
             else:
                 r, g, b = mod.hex_to_rgb(hexcol)
                 intensity = mod.percent_to_intensity(percent)
@@ -237,32 +295,7 @@ class DeviceWorker(QThread):
             if persist:
                 self._run_cli(["set", hexcol, str(percent)])
                 self._emit_cfg(self._cfg())
-                self.op_done.emit("color", True, f"Set #{hexcol} @ {percent}% (pkexec)")
-            # preview: silently skip when not permitted
-
-    def _op_brightness(self, mod, percent, persist):
-        # Used by the tray (no on-screen color picker): keep the saved color.
-        try:
-            dev = self._ensure_device()
-        except SystemExit:
-            return
-        try:
-            if persist:
-                cfg = self._cfg()
-                mod.cmd_brightness(cfg, dev, str(percent))
-                self._emit_cfg(cfg)
-                self.op_done.emit("brightness", True, f"Brightness {percent}%")
-            else:
-                cfg = self._cfg()
-                r, g, b = mod.hex_to_rgb(cfg["color"])
-                intensity = mod.percent_to_intensity(percent)
-                mod.set_firmware_mode(dev, False)
-                mod.set_color(dev, r, g, b, intensity)
-        except PermissionError:
-            if persist:
-                self._run_cli(["brightness", str(percent)])
-                self._emit_cfg(self._cfg())
-                self.op_done.emit("brightness", True, f"Brightness {percent}% (pkexec)")
+                self.op_done.emit("color", True, f"Set #{hexcol} (pkexec)")
 
     def _op_power(self, mod, on):
         try:
@@ -483,18 +516,24 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.worker = worker
         self.mod = mod
+        self.kbd = KbdBacklight()
         self._suppress = False           # block feedback loops while we set widgets
         self._interacting = False        # user dragging a control
         self._devinfo = None
         self._preset_btns = []
         self._dev_widgets = []
 
+        # Unified-brightness state
+        self._brightness_b = 100         # slider value (unified 0..100)
+        self._percent = 100              # HID intensity % sent to vrgb
+        self._expected_fw = self.kbd.level() if self.kbd.available else None
+        self._fw_ignore_until = 0.0      # monotonic deadline to ignore self-induced fw changes
+
         self.setWindowTitle("VRGB — Keyboard RGB")
         self.setWindowIcon(make_logo_icon())
 
         cfg = mod.load_config()
         self._color = QColor("#" + cfg.get("color", "aa00ff"))
-        self._percent = int(cfg.get("percent", 100))
 
         self._build_ui()
         self._wire_worker()
@@ -503,10 +542,41 @@ class MainWindow(QMainWindow):
         self._preview.setSingleShot(True)
         self._preview.setInterval(45)
         self._preview.timeout.connect(self._emit_preview)
-        self._pending = None             # ("color", hex, percent)
+        self._pending = None             # (hex, hid_percent)
 
         self._load_from_cfg(cfg)
+
+        # Poll the firmware backlight so FN+F4/F3 move the slider too.
+        if self.kbd.available:
+            self._fw_timer = QTimer(self)
+            self._fw_timer.setInterval(300)
+            self._fw_timer.timeout.connect(self._poll_firmware)
+            self._fw_timer.start()
+
         self.worker.submit("detect")
+
+    # ---- unified brightness math ----
+    def _levels_for(self, b):
+        """Unified brightness B (0..100) -> (firmware_level | None, hid_percent)."""
+        b = max(0, min(100, int(round(b))))
+        if not self.kbd.available:
+            return None, b                       # pure HID
+        if b <= 0:
+            return 0, 0
+        maxf = self.kbd.max
+        f = max(1, math.ceil(b / 100.0 * maxf))  # smallest fw step that can reach b
+        i = min(100, int(round(b * maxf / f)))   # HID fills the gap: (f/maxf)*(i/100)=b/100
+        return f, i
+
+    def _b_from(self, fw_level, hid_percent):
+        if not self.kbd.available or fw_level is None:
+            return int(round(hid_percent))
+        return int(round(fw_level * hid_percent / self.kbd.max))
+
+    def _set_firmware(self, level):
+        self._expected_fw = level
+        self._fw_ignore_until = time.monotonic() + 0.6
+        self.worker.submit("fwlevel", level)
 
     # -- UI construction --
     def _build_ui(self):
@@ -566,9 +636,11 @@ class MainWindow(QMainWindow):
         bl.addWidget(QLabel("Brightness"), 0, 1)
         self.bright_slider = QSlider(Qt.Orientation.Horizontal)
         self.bright_slider.setRange(0, 100)
-        self.bright_slider.setValue(self._percent)
+        self.bright_slider.setValue(self._brightness_b)
+        if self.kbd.available:
+            self.bright_slider.setToolTip("Unified brightness — also moves with FN+F4 / FN+F3")
         bl.addWidget(self.bright_slider, 0, 2)
-        self.bright_lbl = QLabel(f"{self._percent}%")
+        self.bright_lbl = QLabel(f"{self._brightness_b}%")
         self.bright_lbl.setMinimumWidth(40)
         bl.addWidget(self.bright_lbl, 0, 3)
 
@@ -596,7 +668,6 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Device-dependent widgets, gated on detection
         self._dev_widgets = [
             self.wheel, self.value_slider, self.hex_edit,
             self.bright_slider, self.power_btn, self.auto_chk,
@@ -627,17 +698,25 @@ class MainWindow(QMainWindow):
     def _load_from_cfg(self, cfg):
         self._suppress = True
         self._color = QColor("#" + cfg.get("color", "aa00ff"))
-        self._percent = int(cfg.get("percent", 100))
+        self._percent = int(cfg.get("percent", 100))   # HID intensity %
+
+        fw = self.kbd.level() if self.kbd.available else None
+        if self.kbd.available and fw is None:
+            fw = self.kbd.max
+        if fw is not None:
+            self._expected_fw = fw
+        self._brightness_b = self._b_from(fw, self._percent)
+
         h, s, v, _ = self._color.getHsvF()
         h = max(h, 0.0)              # gray -> hue is -1; clamp
         self.wheel.set_hsv(h, s, v)
         self.value_slider.setValue(int(v * 100))
         self.hex_edit.setText(self._color.name())
         self._update_swatch()
-        self.bright_slider.setValue(self._percent)
-        self.bright_lbl.setText(f"{self._percent}%")
-        self.power_btn.setChecked(self._percent > 0)
-        self.power_btn.setText("On" if self._percent > 0 else "Off")
+        self.bright_slider.setValue(self._brightness_b)
+        self.bright_lbl.setText(f"{self._brightness_b}%")
+        self.power_btn.setChecked(self._brightness_b > 0)
+        self.power_btn.setText("On" if self._brightness_b > 0 else "Off")
         self.auto_chk.setChecked(bool(cfg.get("autonomous", False)))
         self._reload_profiles(cfg)
         self._suppress = False
@@ -717,12 +796,26 @@ class MainWindow(QMainWindow):
     def _on_brightness(self, val):
         if self._suppress:
             return
+        # val is the unified brightness B; decompose into firmware step + HID intensity.
+        self._brightness_b = val
+        fw, hid = self._levels_for(val)
+        self._percent = hid
         self.bright_lbl.setText(f"{val}%")
-        self._percent = val
         self.power_btn.setChecked(val > 0)
         self.power_btn.setText("On" if val > 0 else "Off")
-        # Brightness applies the on-screen color (not the last saved one).
+        if fw is not None:
+            self._set_firmware(fw)
         self._queue_preview()
+
+    def set_brightness_external(self, b):
+        """Set unified brightness from the tray (or anywhere) and persist it."""
+        b = max(0, min(100, int(b)))
+        if self.bright_slider.value() == b:
+            # value unchanged -> valueChanged won't fire; apply directly
+            self._on_brightness(b)
+        else:
+            self.bright_slider.setValue(b)   # fires _on_brightness
+        self._commit_color()
 
     def _on_power(self, checked):
         if self._suppress:
@@ -740,12 +833,34 @@ class MainWindow(QMainWindow):
             return
         self.worker.submit("rainbow", bool(checked))
 
+    # -- firmware (FN+F4/F3) polling --
+    def _poll_firmware(self):
+        if not self.kbd.available or self._interacting:
+            return
+        if time.monotonic() < self._fw_ignore_until:
+            return
+        cur = self.kbd.level()
+        if cur is None or cur == self._expected_fw:
+            return
+        # FN key changed the firmware level -> mirror it into the slider + HID.
+        self._expected_fw = cur
+        b = int(round(cur * 100 / self.kbd.max))
+        self._suppress = True
+        self._brightness_b = b
+        self._percent = 100              # FN snaps the HID sub-step to full
+        self.bright_slider.setValue(b)
+        self.bright_lbl.setText(f"{b}%")
+        self.power_btn.setChecked(b > 0)
+        self.power_btn.setText("On" if b > 0 else "Off")
+        self._suppress = False
+        # Persist the matching color/intensity (keeps the current color).
+        self.worker.submit("color", self._current_hex(), self._percent, True)
+
     # -- profiles --
     def _profile_save(self):
         name, ok = QInputDialog.getText(self, "Save profile", "Profile name:")
         if ok and name.strip():
-            # Persist the on-screen color/brightness first so the snapshot matches.
-            self._commit_color()
+            self._commit_color()         # persist on-screen state first
             self.worker.submit("profile_save", name.strip())
 
     def _profile_load(self):
@@ -789,7 +904,6 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText("✗ " + (err or "Keyboard not found"))
 
     def _on_config_updated(self, cfg):
-        # Never yank the wheel/sliders mid-drag; just refresh the profile list.
         if self._interacting:
             self._reload_profiles(cfg)
             return
@@ -809,7 +923,6 @@ class Tray(QSystemTrayIcon):
         self.setToolTip("VRGB — keyboard RGB")
 
         menu = QMenu()
-        # Parent every QAction to `self` so none are garbage-collected.
         self.act_show = QAction("Show / hide window", self)
         self.act_show.triggered.connect(self._toggle_window)
         menu.addAction(self.act_show)
@@ -825,7 +938,7 @@ class Tray(QSystemTrayIcon):
         bmenu = menu.addMenu("Brightness")
         for pct in (25, 50, 75, 100):
             a = QAction(f"{pct}%", self)
-            a.triggered.connect(lambda _=False, p=pct: self.worker.submit("brightness", p, True))
+            a.triggered.connect(lambda _=False, p=pct: self.window.set_brightness_external(p))
             bmenu.addAction(a)
 
         self.profiles_menu = menu.addMenu("Profiles")
@@ -867,8 +980,6 @@ class Tray(QSystemTrayIcon):
 
     def _quit(self):
         self.worker.stop()
-        # Drain the worker fully (it may be inside a pkexec dialog) before quitting
-        # so the QThread is never destroyed while running.
         if not self.worker.wait(3000):
             self.worker.terminate()
             self.worker.wait(1000)
@@ -897,7 +1008,6 @@ def main():
 
     tray = Tray(window, worker, app) if QSystemTrayIcon.isSystemTrayAvailable() else None
     if tray:
-        # Live in the tray: closing the window only hides it.
         app.setQuitOnLastWindowClosed(False)
         tray.show()
 
@@ -907,7 +1017,6 @@ def main():
             tray.showMessage("VRGB", "Still running in the tray.",
                              QSystemTrayIcon.MessageIcon.Information, 2000)
         window.closeEvent = close_event
-    # else: no tray -> default quit-on-last-window-closed (True) so closing exits.
 
     if "--tray" in sys.argv and tray:
         pass  # start hidden to the tray

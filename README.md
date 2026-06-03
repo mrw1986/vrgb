@@ -179,7 +179,12 @@ config logic are shared with the command line — no duplicated device code.
 
 - HS color wheel + value slider, hex entry, and preset swatches
 - Live preview while you drag (throttled), persisted on release
-- Brightness slider (0–100%) and a power on/off toggle
+- Unified brightness slider (0–100%) that is **tied to the FN+F4 / FN+F3 keys**: it
+  decomposes brightness into the firmware backlight step (`asus::kbd_backlight`, set
+  via logind) and vrgb's HID intensity so the two layers never double-dim, and it
+  polls the firmware level so the hardware keys move the slider too. Falls back to
+  pure-HID brightness if the LED node / logind is unavailable.
+- A power on/off toggle
 - Firmware/autonomous mode toggle
 - OEM rainbow toggle (auto-disabled on device mappings that do not support it)
 - Profile manager (save / load / delete)
