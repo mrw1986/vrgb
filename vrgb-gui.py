@@ -54,6 +54,7 @@ from PyQt6.QtGui import (
     QIcon,
     QPixmap,
     QAction,
+    QActionGroup,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -581,6 +582,12 @@ def make_logo_icon():
     return QIcon(pm)
 
 
+def swatch_icon(hexc):
+    pm = QPixmap(16, 16)
+    pm.fill(QColor("#" + hexc))
+    return QIcon(pm)
+
+
 # ----------------------------------------------------------------------------
 # Main window
 # ----------------------------------------------------------------------------
@@ -1039,26 +1046,39 @@ class Tray(QSystemTrayIcon):
         menu.addAction(self.act_show)
         menu.addSeparator()
 
-        # Embedded brightness slider
-        menu.addAction(self._caption("Brightness"))
-        menu.addAction(self._make_brightness_action())
-
         self.act_on = QAction("Turn on", self)
         self.act_on.triggered.connect(lambda: self.worker.submit("power", True))
         self.act_off = QAction("Turn off", self)
         self.act_off.triggered.connect(lambda: self.worker.submit("power", False))
         menu.addAction(self.act_on)
         menu.addAction(self.act_off)
-        menu.addSeparator()
 
-        # Embedded color picker (preset swatches + full dialog)
-        menu.addAction(self._caption("Color"))
-        menu.addAction(self._make_color_action())
+        # Brightness as a submenu of discrete steps. KDE's tray menu is rendered over
+        # DBusMenu, which cannot host an embedded QSlider widget — only plain items.
+        self.bright_menu = menu.addMenu("Brightness")
+        self._bright_group = QActionGroup(self)
+        self._bright_group.setExclusive(True)
+        self._bright_actions = []
+        for pct in (10, 25, 50, 75, 100):
+            a = QAction(f"{pct}%", self)
+            a.setCheckable(True)
+            a.triggered.connect(lambda _=False, p=pct: self.window.set_brightness_external(p))
+            self._bright_group.addAction(a)
+            self.bright_menu.addAction(a)
+            self._bright_actions.append((pct, a))
+
+        # Color as a submenu of preset swatches (colored icons) + the full dialog.
+        self.color_menu = menu.addMenu("Color")
+        for name, hexc in PRESETS:
+            a = QAction(swatch_icon(hexc), name, self)
+            a.triggered.connect(lambda _=False, h=hexc: self.window._apply_hex("#" + h, commit=True))
+            self.color_menu.addAction(a)
+        self.color_menu.addSeparator()
         self.act_more = QAction("More colors…", self)
         self.act_more.triggered.connect(self._pick_color)
-        menu.addAction(self.act_more)
-        menu.addSeparator()
+        self.color_menu.addAction(self.act_more)
 
+        menu.addSeparator()
         self.profiles_menu = menu.addMenu("Profiles")
         self._rebuild_profiles(window.mod.load_config())
         worker.config_updated.connect(self._rebuild_profiles)
@@ -1072,66 +1092,12 @@ class Tray(QSystemTrayIcon):
         self.setContextMenu(menu)
         self.activated.connect(self._on_activated)
 
-    # -- embedded-widget builders --
-    def _caption(self, text):
-        a = QWidgetAction(self)
-        lbl = QLabel(f"  {text}")
-        lbl.setStyleSheet("color:#888; font-size:11px; padding:2px 0 0 0;")
-        a.setDefaultWidget(lbl)
-        a.setEnabled(False)
-        return a
-
-    def _make_brightness_action(self):
-        a = QWidgetAction(self)
-        w = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(12, 2, 10, 6)
-        self.b_slider = QSlider(Qt.Orientation.Horizontal)
-        self.b_slider.setRange(0, 100)
-        self.b_slider.setMinimumWidth(170)
-        self.b_slider.valueChanged.connect(self._on_tray_brightness)
-        self.b_slider.sliderReleased.connect(self._commit_tray_brightness)
-        self.b_value = QLabel("--%")
-        self.b_value.setMinimumWidth(36)
-        lay.addWidget(self.b_slider)
-        lay.addWidget(self.b_value)
-        a.setDefaultWidget(w)
-        return a
-
-    def _make_color_action(self):
-        a = QWidgetAction(self)
-        w = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(12, 2, 10, 6)
-        lay.setSpacing(4)
-        for name, hexc in PRESETS:
-            btn = QPushButton()
-            btn.setFixedSize(20, 20)
-            btn.setToolTip(name)
-            btn.setStyleSheet(f"background:#{hexc}; border:1px solid #444; border-radius:3px;")
-            btn.clicked.connect(lambda _=False, h=hexc: self.window._apply_hex("#" + h, commit=True))
-            lay.addWidget(btn)
-        lay.addStretch(1)
-        a.setDefaultWidget(w)
-        return a
-
-    # -- embedded-widget behavior --
     def _sync_controls(self):
-        self._tray_suppress = True
-        b = int(self.window._brightness_b)
-        self.b_slider.setValue(b)
-        self.b_value.setText(f"{b}%")
-        self._tray_suppress = False
-
-    def _on_tray_brightness(self, v):
-        self.b_value.setText(f"{v}%")
-        if self._tray_suppress:
-            return
-        # Drive the main window slider, reusing its firmware decomposition + preview.
-        self.window.bright_slider.setValue(v)
-
-    def _commit_tray_brightness(self):
-        self.window._commit_color()
+        # Tick the brightness step nearest the current unified brightness.
+        b = self.window._brightness_b
+        nearest = min(self._bright_actions, key=lambda pa: abs(pa[0] - b))[1]
+        for _pct, a in self._bright_actions:
+            a.setChecked(a is nearest)
 
     def _pick_color(self):
         col = QColorDialog.getColor(self.window._color, self.window, "Pick keyboard color")
